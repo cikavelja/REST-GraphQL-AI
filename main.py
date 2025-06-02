@@ -1,9 +1,9 @@
 from fastapi import FastAPI, Depends, HTTPException
 from strawberry.fastapi import GraphQLRouter
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy import Column, Integer, String, Text, ForeignKey, select
+from sqlalchemy import Column, Integer, String, Text, select
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.orm import sessionmaker
 import strawberry
 import jwt
 import bcrypt
@@ -18,7 +18,13 @@ embedding_model = SentenceTransformer("all-MiniLM-L6-v2")  # Fast & lightweight 
 
 # Database Configuration
 DATABASE_URL = "postgresql+asyncpg://admin:admin123@127.0.0.1:5432/gqlpy"
-engine = create_async_engine(DATABASE_URL, echo=True)
+engine = create_async_engine(
+    DATABASE_URL, 
+    echo=True,
+    pool_size=20,  # Increase the pool size
+    max_overflow=40,  # Allow more connections when needed
+    pool_timeout=60  # Increase timeout before giving up on connections
+)
 SessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 Base = declarative_base()
 
@@ -27,6 +33,30 @@ SECRET_KEY = "your_secret_key"
 ALGORITHM = "HS256"
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
+# User Model
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    role = Column(String, default="user")
+
+# Article Model
+class Article(Base):
+    __tablename__ = "articles"
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, index=True)
+    content = Column(Text)
+    vector = Column(Text)  # Store vector embedding as JSON
+    search_text = Column(Text)  # Full-text search field
+
+# Async Database Dependency
+@asynccontextmanager
+async def get_db_session():
+    async with SessionLocal() as session:
+        yield session
+
+# Utility Functions
 async def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
@@ -48,56 +78,18 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# User Model
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True)
-    password_hash = Column(String)
-    role = Column(String, default="user")
-
-# Category Model
-class Category(Base):
-    __tablename__ = "categories"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, unique=True, index=True)
-    articles = relationship("Article", back_populates="category")
-
-# Article Model
-class Article(Base):
-    __tablename__ = "articles"
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String, index=True)
-    content = Column(Text)
-    vector = Column(Text)
-    search_text = Column(Text)
-    category_id = Column(Integer, ForeignKey("categories.id"))
-    category = relationship("Category", back_populates="articles")
-
-# Async Database Dependency
-@asynccontextmanager
-async def get_db_session():
-    async with SessionLocal() as session:
-        yield session
-
-# GraphQL Types
+# GraphQL Schema
 @strawberry.type
-class CategoryType:
+class UserType:
     id: int
-    name: str
+    username: str
+    role: str
 
 @strawberry.type
 class ArticleType:
     id: int
     title: str
     content: str
-    category: Optional[CategoryType]
-
-@strawberry.type
-class UserType:
-    id: int
-    username: str
-    role: str
 
 @strawberry.type
 class Query:
@@ -114,35 +106,39 @@ class Query:
         return result.scalar_one_or_none()
     
     @strawberry.field
-    async def list_categories(self, info) -> List[CategoryType]:
+    async def search_articles_semantic(self, info, query: str) -> List[ArticleType]:
         db: AsyncSession = info.context["db"]
-        result = await db.execute(select(Category))
-        return result.scalars().all()
-    
-    @strawberry.field
-    async def protected_info(self, info, user: UserType = Depends(get_current_user)) -> str:
-        return f"Protected data for {user.username}"
+        
+        # Convert the query to an embedding vector
+        query_vector = embedding_model.encode(query).tolist()
+        query_vector_str = f"ARRAY{query_vector}"  # Convert to SQL array format
+
+        # Query the database using cosine similarity technique
+        result = await db.execute(
+            f"""
+            SELECT id, title, content 
+            FROM articles
+            ORDER BY vector <-> {query_vector_str}
+            LIMIT 5;
+            """
+        )
+        return result.fetchall()
+
 
 @strawberry.type
 class Mutation:
     @strawberry.mutation
-    async def create_article(self, info, title: str, content: str, category_id: int) -> ArticleType:
+    async def create_article(self, info, title: str, content: str) -> ArticleType:
         db: AsyncSession = info.context["db"]
-        embedding_vector = embedding_model.encode(content).tolist()
-        article = Article(title=title, content=content, vector=json.dumps(embedding_vector), category_id=category_id)
+
+        # Generate embeddings using the local model
+        embedding_vector = embedding_model.encode(content).tolist()  # Convert NumPy array to list
+        
+        article = Article(title=title, content=content, vector=json.dumps(embedding_vector))
         db.add(article)
         await db.commit()
         await db.refresh(article)
         return article
-
-    @strawberry.mutation
-    async def create_category(self, info, name: str) -> CategoryType:
-        db: AsyncSession = info.context["db"]
-        category = Category(name=name)
-        db.add(category)
-        await db.commit()
-        await db.refresh(category)
-        return category
 
     @strawberry.mutation
     async def register_user(self, info, username: str, password: str) -> UserType:
@@ -160,7 +156,8 @@ async def get_context():
 schema = strawberry.Schema(query=Query, mutation=Mutation)
 
 # FastAPI App
-app = FastAPI()
+app = FastAPI(title="AI-Powered GraphQL API", description="GraphQL API with Full-Text & Vector Search")
+
 gql_router = GraphQLRouter(schema, context_getter=get_context)
 app.include_router(gql_router, prefix="/graphql")
 
@@ -173,10 +170,10 @@ async def login(form_data: dict):
             raise HTTPException(status_code=401, detail="Invalid credentials")
         return {"access_token": await create_access_token({"sub": user.username}), "token_type": "bearer"}
 
-@app.get("/protected")
-async def protected_route(user: dict = Depends(get_current_user)):
-    return {"message": "You have access", "user": user}
-
 @app.get("/health")
 async def health_check():
     return {"status": "OK"}
+
+@app.get("/protected")
+async def protected_route(user: dict = Depends(get_current_user)):
+    return {"message": "You have access", "user": user}
